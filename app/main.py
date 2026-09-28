@@ -1,6 +1,8 @@
 from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
+from .webhooks import send_webhook
 from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.middleware.cors import CORSMiddleware
 from .security import (
     hash_password,
     verify_password,
@@ -20,6 +22,7 @@ from .models import (
     UserRole,
     Sprint,
     SprintStatus,
+    Severity,
 )
 from app.schemas import (
     IssueCreate,
@@ -44,6 +47,13 @@ app = FastAPI(
     version="1.0.0",
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def get_db():
     db = SessionLocal()
@@ -169,7 +179,6 @@ def login_user(
         "access_token": access_token,
         "token_type": "bearer"
     }
-
 # Create Issue
 @app.post("/issues", response_model=IssueResponse)
 def create_issue(
@@ -203,6 +212,7 @@ def create_issue(
         project_key=issue.project_key,
         reporter_id=issue.reporter_id,
         assignee_id=issue.assignee_id,
+        sprint_id=issue.sprint_id,
     )
 
     db.add(issue_data)
@@ -219,6 +229,23 @@ def create_issue(
 
     db.add(activity)
     db.commit()
+
+    # Send Webhook
+    try:
+        send_webhook(
+            event="ISSUE_CREATED",
+            data={
+                "issue_id": issue_data.id,
+                "issue_key": issue_data.issue_key,
+                "title": issue_data.title,
+                "status": issue_data.status.value,
+                "priority": issue_data.priority.value,
+                "severity": issue_data.severity.value,
+                "project_key": issue_data.project_key
+            }
+        )
+    except Exception:
+        pass
 
     return issue_data
 
@@ -808,3 +835,234 @@ def admin_dashboard(
         "total_users": total_users,
         "total_sprints": total_sprints
     }
+
+# Issue Summary Report
+@app.get("/reports/summary")
+def issue_summary_report(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    total_issues = db.query(Issue).count()
+
+    open_issues = (
+        db.query(Issue)
+        .filter(
+            Issue.status.notin_([
+                IssueStatus.RESOLVED,
+                IssueStatus.CLOSED
+            ])
+        )
+        .count()
+    )
+
+    resolved_issues = (
+        db.query(Issue)
+        .filter(Issue.status == IssueStatus.RESOLVED)
+        .count()
+    )
+
+    closed_issues = (
+        db.query(Issue)
+        .filter(Issue.status == IssueStatus.CLOSED)
+        .count()
+    )
+
+    return {
+        "total_issues": total_issues,
+        "open_issues": open_issues,
+        "resolved_issues": resolved_issues,
+        "closed_issues": closed_issues
+    }
+
+# Severity Analytics
+@app.get("/analytics/severity")
+def severity_analytics(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    total_issues = db.query(Issue).count()
+
+    severity_counts = {}
+
+    for severity in Severity:
+        count = (
+            db.query(Issue)
+            .filter(Issue.severity == severity)
+            .count()
+        )
+
+        severity_counts[severity.value] = count
+
+    return {
+        "total_issues": total_issues,
+        "issues_by_severity": severity_counts
+    }
+
+# Issue Filter Report
+@app.get("/reports/issues")
+def issue_filter_report(
+    status: IssueStatus | None = None,
+    priority: Priority | None = None,
+    severity: Severity | None = None,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    query = db.query(Issue)
+
+    if status is not None:
+        query = query.filter(Issue.status == status)
+
+    if priority is not None:
+        query = query.filter(Issue.priority == priority)
+
+    if severity is not None:
+        query = query.filter(Issue.severity == severity)
+
+    issues = query.all()
+
+    return {
+        "total_results": len(issues),
+        "filters": {
+            "status": status.value if status else None,
+            "priority": priority.value if priority else None,
+            "severity": severity.value if severity else None
+        },
+        "issues": [
+            {
+                "id": issue.id,
+                "issue_key": issue.issue_key,
+                "title": issue.title,
+                "status": issue.status.value,
+                "priority": issue.priority.value,
+                "severity": issue.severity.value
+            }
+            for issue in issues
+        ]
+    }
+
+# Sprint Report
+@app.get("/reports/sprints")
+def sprint_report(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    sprints = db.query(Sprint).all()
+
+    return {
+        "total_sprints": len(sprints),
+        "sprints": [
+            {
+                "id": sprint.id,
+                "name": sprint.name,
+                "status": sprint.status.value,
+                "start_date": sprint.start_date,
+                "end_date": sprint.end_date
+            }
+            for sprint in sprints
+        ]
+    }
+
+# Sprint Issue Report
+@app.get("/reports/sprints/{sprint_id}/issues")
+def sprint_issue_report(
+    sprint_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    sprint = (
+        db.query(Sprint)
+        .filter(Sprint.id == sprint_id)
+        .first()
+    )
+
+    if sprint is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Sprint not found"
+        )
+
+    issues = (
+        db.query(Issue)
+        .filter(Issue.sprint_id == sprint_id)
+        .all()
+    )
+
+    return {
+        "sprint": {
+            "id": sprint.id,
+            "name": sprint.name,
+            "status": sprint.status.value
+        },
+        "total_issues": len(issues),
+        "issues": [
+            {
+                "id": issue.id,
+                "issue_key": issue.issue_key,
+                "title": issue.title,
+                "status": issue.status.value,
+                "priority": issue.priority.value,
+                "severity": issue.severity.value
+            }
+            for issue in issues
+        ]
+    }
+
+# Sprint Status Summary Report
+@app.get("/reports/sprints/{sprint_id}/summary")
+def sprint_status_summary(
+    sprint_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    sprint = (
+        db.query(Sprint)
+        .filter(Sprint.id == sprint_id)
+        .first()
+    )
+
+    if sprint is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Sprint not found"
+        )
+
+    status_counts = {}
+
+    for status in IssueStatus:
+        count = (
+            db.query(Issue)
+            .filter(
+                Issue.sprint_id == sprint_id,
+                Issue.status == status
+            )
+            .count()
+        )
+
+        status_counts[status.value] = count
+
+    total_issues = sum(status_counts.values())
+
+    return {
+        "sprint": {
+            "id": sprint.id,
+            "name": sprint.name,
+            "status": sprint.status.value
+        },
+        "total_issues": total_issues,
+        "issues_by_status": status_counts
+    }
+
+# Webhook Test
+@app.post("/webhooks/test")
+def webhook_test(
+    current_user: dict = Depends(get_current_user)
+):
+    result = send_webhook(
+        event="BUGFLOW_TEST",
+        data={
+            "message": "BugFlow webhook integration is working",
+            "project": "BugFlow"
+        }
+    )
+
+    return result

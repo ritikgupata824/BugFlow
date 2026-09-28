@@ -28,7 +28,7 @@ class IssueCreate(BaseModel):
     sprint_id: int | None = None
 
 
-# Response Schema
+# Issue Response Schema
 class IssueResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -138,6 +138,7 @@ class SprintCreate(BaseModel):
     description: str | None = None
     start_date: datetime
     end_date: datetime
+    status: SprintStatus = SprintStatus.PLANNED
     project_key: str
 
 
