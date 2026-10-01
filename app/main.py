@@ -1,8 +1,11 @@
 from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
-from .webhooks import send_webhook
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from difflib import SequenceMatcher
+
+from .webhooks import send_webhook
+
 from .security import (
     hash_password,
     verify_password,
@@ -12,10 +15,11 @@ from .security import (
 )
 
 from .database import SessionLocal
+
 from .models import (
     Issue,
     IssueStatus,
-      Priority,
+    IssueTag,
     IssueComment,
     IssueActivity,
     User,
@@ -23,7 +27,11 @@ from .models import (
     Sprint,
     SprintStatus,
     Severity,
+    BusinessImpact,
+    Priority,
+    Tag
 )
+
 from app.schemas import (
     IssueCreate,
     IssueResponse,
@@ -39,13 +47,17 @@ from app.schemas import (
     SprintCreate,
     SprintUpdate,
     SprintResponse,
+    TagCreate,
+TagResponse,
 )
+
 
 app = FastAPI(
     title="BugFlow API",
     description="Software Issue Tracking & Resolution Platform",
     version="1.0.0",
 )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,13 +67,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 def get_db():
     db = SessionLocal()
+
     try:
         yield db
     finally:
         db.close()
 
+
+# ============================================================
+# PRIORITY MATRIX
+# ============================================================
+
+def calculate_priority(
+    severity: Severity,
+    business_impact: BusinessImpact
+) -> Priority:
+
+    if (
+        severity == Severity.BLOCKER
+        or business_impact == BusinessImpact.CRITICAL
+    ):
+        return Priority.URGENT
+
+    if (
+        severity == Severity.CRITICAL
+        or business_impact == BusinessImpact.HIGH
+    ):
+        return Priority.HIGH
+
+    if (
+        severity == Severity.MAJOR
+        or business_impact == BusinessImpact.MEDIUM
+    ):
+        return Priority.MEDIUM
+
+    return Priority.LOW
+
+
+# ============================================================
+# ROOT
+# ============================================================
 
 @app.get("/")
 def root():
@@ -78,13 +126,16 @@ def health_check():
     }
 
 
-# Register User
+# ============================================================
+# AUTHENTICATION
+# ============================================================
+
 @app.post("/auth/register", response_model=UserResponse)
 def register_user(
     user: UserCreate,
     db: Session = Depends(get_db)
 ):
-    # Check duplicate username
+
     existing_username = (
         db.query(User)
         .filter(User.username == user.username)
@@ -97,7 +148,6 @@ def register_user(
             detail="Username already exists"
         )
 
-    # Check duplicate email
     existing_email = (
         db.query(User)
         .filter(User.email == user.email)
@@ -110,10 +160,8 @@ def register_user(
             detail="Email already exists"
         )
 
-    # Hash password
     hashed_password = hash_password(user.password)
 
-    # Create user
     new_user = User(
         username=user.username,
         email=user.email,
@@ -129,14 +177,12 @@ def register_user(
     return new_user
 
 
-# Login User
 @app.post("/auth/login", response_model=TokenResponse)
 def login_user(
     login: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
-   
-    # Find user by username
+
     user = (
         db.query(User)
         .filter(User.username == login.username)
@@ -149,7 +195,6 @@ def login_user(
             detail="Invalid username or password"
         )
 
-    # Verify password
     if not verify_password(
         login.password,
         user.hashed_password
@@ -159,14 +204,12 @@ def login_user(
             detail="Invalid username or password"
         )
 
-    # Check active status
     if not user.is_active:
         raise HTTPException(
             status_code=403,
             detail="User account is inactive"
         )
 
-    # Create JWT token
     access_token = create_access_token(
         data={
             "sub": str(user.id),
@@ -179,7 +222,12 @@ def login_user(
         "access_token": access_token,
         "token_type": "bearer"
     }
-# Create Issue
+
+
+# ============================================================
+# ISSUE MANAGEMENT
+# ============================================================
+
 @app.post("/issues", response_model=IssueResponse)
 def create_issue(
     issue: IssueCreate,
@@ -188,6 +236,7 @@ def create_issue(
         require_role(["ADMIN", "REPORTER", "DEVELOPER"])
     )
 ):
+
     last_issue = (
         db.query(Issue)
         .filter(Issue.project_key == issue.project_key)
@@ -195,8 +244,18 @@ def create_issue(
         .first()
     )
 
-    next_number = 1 if last_issue is None else last_issue.id + 1
+    next_number = (
+        1
+        if last_issue is None
+        else last_issue.id + 1
+    )
+
     issue_key = f"{issue.project_key}-{next_number}"
+
+    calculated_priority = calculate_priority(
+        issue.severity,
+        issue.business_impact
+    )
 
     issue_data = Issue(
         issue_key=issue_key,
@@ -205,7 +264,8 @@ def create_issue(
         description=issue.description,
         reproduction_steps=issue.reproduction_steps,
         severity=issue.severity,
-        priority=issue.priority,
+        business_impact=issue.business_impact,
+        priority=calculated_priority,
         affected_module=issue.affected_module,
         environment=issue.environment,
         screenshot_url=issue.screenshot_url,
@@ -219,18 +279,20 @@ def create_issue(
     db.commit()
     db.refresh(issue_data)
 
-    # Create Activity Log
     activity = IssueActivity(
         issue_id=issue_data.id,
         user_id=issue_data.reporter_id,
         action="ISSUE_CREATED",
-        details=f"Issue {issue_data.issue_key} was created."
+        details=(
+            f"Issue {issue_data.issue_key} was created. "
+            f"Priority automatically calculated as "
+            f"{issue_data.priority.value}."
+        )
     )
 
     db.add(activity)
     db.commit()
 
-    # Send Webhook
     try:
         send_webhook(
             event="ISSUE_CREATED",
@@ -241,6 +303,9 @@ def create_issue(
                 "status": issue_data.status.value,
                 "priority": issue_data.priority.value,
                 "severity": issue_data.severity.value,
+                "business_impact": (
+                    issue_data.business_impact.value
+                ),
                 "project_key": issue_data.project_key
             }
         )
@@ -249,14 +314,25 @@ def create_issue(
 
     return issue_data
 
-# Get All Issues
-@app.get("/issues", response_model=list[IssueResponse])
+
+@app.get(
+    "/issues",
+    response_model=list[IssueResponse]
+)
 def get_issues(
     db: Session = Depends(get_db),
     current_user: dict = Depends(
-        require_role(["ADMIN", "REPORTER", "DEVELOPER", "TESTER"])
+        require_role(
+            [
+                "ADMIN",
+                "REPORTER",
+                "DEVELOPER",
+                "TESTER"
+            ]
+        )
     )
 ):
+
     issues = (
         db.query(Issue)
         .order_by(Issue.id.asc())
@@ -266,25 +342,15 @@ def get_issues(
     return issues
 
 
-# Admin Only Test
-@app.get("/admin/test")
-def admin_test(
-    current_user: dict = Depends(
-        require_role(["ADMIN"])
-    )
-):
-    return {
-        "message": "Admin access granted",
-        "username": current_user.get("username"),
-        "role": current_user.get("role")
-    }
-
-# Get Single Issue
-@app.get("/issues/{issue_id}", response_model=IssueResponse)
+@app.get(
+    "/issues/{issue_id}",
+    response_model=IssueResponse
+)
 def get_issue(
     issue_id: int,
     db: Session = Depends(get_db)
 ):
+
     issue = (
         db.query(Issue)
         .filter(Issue.id == issue_id)
@@ -300,9 +366,10 @@ def get_issue(
     return issue
 
 
-
-# Update Issue
-@app.put("/issues/{issue_id}", response_model=IssueResponse)
+@app.put(
+    "/issues/{issue_id}",
+    response_model=IssueResponse
+)
 def update_issue(
     issue_id: int,
     issue: IssueUpdate,
@@ -311,6 +378,7 @@ def update_issue(
         require_role(["ADMIN", "DEVELOPER"])
     )
 ):
+
     existing_issue = (
         db.query(Issue)
         .filter(Issue.id == issue_id)
@@ -323,28 +391,49 @@ def update_issue(
             detail="Issue not found"
         )
 
-    update_data = issue.model_dump(exclude_unset=True)
+    update_data = issue.model_dump(
+        exclude_unset=True
+    )
 
     for field, value in update_data.items():
-        setattr(existing_issue, field, value)
+        setattr(
+            existing_issue,
+            field,
+            value
+        )
+
+    if (
+        "severity" in update_data
+        or "business_impact" in update_data
+    ):
+        existing_issue.priority = calculate_priority(
+            existing_issue.severity,
+            existing_issue.business_impact
+        )
 
     db.commit()
     db.refresh(existing_issue)
 
-    # Create Activity Log
     activity = IssueActivity(
         issue_id=existing_issue.id,
         user_id=int(current_user.get("sub")),
         action="ISSUE_UPDATED",
-        details=f"Updated fields: {', '.join(update_data.keys())}."
+        details=(
+            f"Updated fields: "
+            f"{', '.join(update_data.keys())}."
+        )
     )
 
     db.add(activity)
     db.commit()
 
     return existing_issue
-# Assign / Reassign Issue
-@app.put("/issues/{issue_id}/assign", response_model=IssueResponse)
+
+
+@app.put(
+    "/issues/{issue_id}/assign",
+    response_model=IssueResponse
+)
 def assign_issue(
     issue_id: int,
     assignment: IssueAssign,
@@ -353,6 +442,7 @@ def assign_issue(
         require_role(["ADMIN", "DEVELOPER"])
     )
 ):
+
     issue = (
         db.query(Issue)
         .filter(Issue.id == issue_id)
@@ -372,14 +462,14 @@ def assign_issue(
     db.commit()
     db.refresh(issue)
 
-    # Create Activity Log
     activity = IssueActivity(
         issue_id=issue.id,
         user_id=int(current_user.get("sub")),
         action="ISSUE_ASSIGNED",
         details=(
             f"Assignee changed from "
-            f"{old_assignee} to {assignment.assignee_id}."
+            f"{old_assignee} to "
+            f"{assignment.assignee_id}."
         )
     )
 
@@ -389,14 +479,39 @@ def assign_issue(
     return issue
 
 
-# Add Comment to Issue
-@app.post("/issues/{issue_id}/comments", response_model=CommentResponse)
+# ============================================================
+# ADMIN
+# ============================================================
+
+@app.get("/admin/test")
+def admin_test(
+    current_user: dict = Depends(
+        require_role(["ADMIN"])
+    )
+):
+
+    return {
+        "message": "Admin access granted",
+        "username": current_user.get("username"),
+        "role": current_user.get("role")
+    }
+
+
+# ============================================================
+# COMMENTS
+# ============================================================
+
+@app.post(
+    "/issues/{issue_id}/comments",
+    response_model=CommentResponse
+)
 def add_comment(
     issue_id: int,
     comment: CommentCreate,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+
     issue = (
         db.query(Issue)
         .filter(Issue.id == issue_id)
@@ -432,13 +547,16 @@ def add_comment(
     return new_comment
 
 
-# Get Comments for an Issue
-@app.get("/issues/{issue_id}/comments", response_model=list[CommentResponse])
+@app.get(
+    "/issues/{issue_id}/comments",
+    response_model=list[CommentResponse]
+)
 def get_comments(
     issue_id: int,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+
     issue = (
         db.query(Issue)
         .filter(Issue.id == issue_id)
@@ -453,7 +571,9 @@ def get_comments(
 
     comments = (
         db.query(IssueComment)
-        .filter(IssueComment.issue_id == issue_id)
+        .filter(
+            IssueComment.issue_id == issue_id
+        )
         .order_by(IssueComment.id.asc())
         .all()
     )
@@ -461,16 +581,25 @@ def get_comments(
     return comments
 
 
-# Get Activity History for an Issue
-@app.put("/issues/{issue_id}/status", response_model=IssueResponse)
+# ============================================================
+# ISSUE STATUS / WORKFLOW
+# ============================================================
+
+@app.put(
+    "/issues/{issue_id}/status",
+    response_model=IssueResponse
+)
 def update_issue_status(
     issue_id: int,
     status: IssueStatus,
     db: Session = Depends(get_db),
     current_user: dict = Depends(
-        require_role(["ADMIN", "DEVELOPER", "TESTER"])
+        require_role(
+            ["ADMIN", "DEVELOPER", "TESTER"]
+        )
     )
 ):
+
     issue = (
         db.query(Issue)
         .filter(Issue.id == issue_id)
@@ -485,28 +614,55 @@ def update_issue_status(
 
     old_status = issue.status
 
-    # Validate Issue Status Transition
     allowed_transitions = {
-        IssueStatus.REPORTED: [IssueStatus.TRIAGED],
-        IssueStatus.TRIAGED: [IssueStatus.ASSIGNED],
-        IssueStatus.ASSIGNED: [IssueStatus.IN_DEVELOPMENT],
-        IssueStatus.IN_DEVELOPMENT: [IssueStatus.IN_REVIEW],
-        IssueStatus.IN_REVIEW: [IssueStatus.IN_TESTING],
-        IssueStatus.IN_TESTING: [IssueStatus.RESOLVED],
+        IssueStatus.REPORTED: [
+            IssueStatus.TRIAGED
+        ],
+
+        IssueStatus.TRIAGED: [
+            IssueStatus.ASSIGNED
+        ],
+
+        IssueStatus.ASSIGNED: [
+            IssueStatus.IN_DEVELOPMENT
+        ],
+
+        IssueStatus.IN_DEVELOPMENT: [
+            IssueStatus.IN_REVIEW
+        ],
+
+        IssueStatus.IN_REVIEW: [
+            IssueStatus.IN_TESTING
+        ],
+
+        IssueStatus.IN_TESTING: [
+            IssueStatus.RESOLVED
+        ],
+
         IssueStatus.RESOLVED: [
             IssueStatus.CLOSED,
             IssueStatus.REOPENED
         ],
-        IssueStatus.CLOSED: [IssueStatus.REOPENED],
-        IssueStatus.REOPENED: [IssueStatus.TRIAGED],
+
+        IssueStatus.CLOSED: [
+            IssueStatus.REOPENED
+        ],
+
+        IssueStatus.REOPENED: [
+            IssueStatus.TRIAGED
+        ],
     }
 
-    if status not in allowed_transitions.get(old_status, []):
+    if status not in allowed_transitions.get(
+        old_status,
+        []
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Invalid status transition from "
-                f"{old_status.value} to {status.value}."
+                f"{old_status.value} to "
+                f"{status.value}."
             )
         )
 
@@ -515,15 +671,14 @@ def update_issue_status(
     db.commit()
     db.refresh(issue)
 
-    # Create Activity Log
-    # Actual logged-in user is recorded
     activity = IssueActivity(
         issue_id=issue.id,
         user_id=int(current_user.get("sub")),
         action="STATUS_CHANGED",
         details=(
             f"Status changed from "
-            f"{old_status.value} to {status.value}."
+            f"{old_status.value} to "
+            f"{status.value}."
         )
     )
 
@@ -532,13 +687,21 @@ def update_issue_status(
 
     return issue
 
-# Get Issue Activity Logs
-@app.get("/issues/{issue_id}/activities", response_model=list[ActivityResponse])
+
+# ============================================================
+# ACTIVITY HISTORY
+# ============================================================
+
+@app.get(
+    "/issues/{issue_id}/activities",
+    response_model=list[ActivityResponse]
+)
 def get_issue_activities(
     issue_id: int,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+
     issue = (
         db.query(Issue)
         .filter(Issue.id == issue_id)
@@ -553,15 +716,24 @@ def get_issue_activities(
 
     activities = (
         db.query(IssueActivity)
-        .filter(IssueActivity.issue_id == issue_id)
+        .filter(
+            IssueActivity.issue_id == issue_id
+        )
         .order_by(IssueActivity.id.asc())
         .all()
     )
 
     return activities
 
-# Create Sprint
-@app.post("/sprints", response_model=SprintResponse)
+
+# ============================================================
+# SPRINT MANAGEMENT
+# ============================================================
+
+@app.post(
+    "/sprints",
+    response_model=SprintResponse
+)
 def create_sprint(
     sprint: SprintCreate,
     db: Session = Depends(get_db),
@@ -569,6 +741,7 @@ def create_sprint(
         require_role(["ADMIN", "DEVELOPER"])
     )
 ):
+
     new_sprint = Sprint(
         name=sprint.name,
         description=sprint.description,
@@ -584,12 +757,16 @@ def create_sprint(
 
     return new_sprint
 
-# Get All Sprints
-@app.get("/sprints", response_model=list[SprintResponse])
+
+@app.get(
+    "/sprints",
+    response_model=list[SprintResponse]
+)
 def get_sprints(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+
     sprints = (
         db.query(Sprint)
         .order_by(Sprint.id.asc())
@@ -598,8 +775,11 @@ def get_sprints(
 
     return sprints
 
-# Update Sprint
-@app.put("/sprints/{sprint_id}", response_model=SprintResponse)
+
+@app.put(
+    "/sprints/{sprint_id}",
+    response_model=SprintResponse
+)
 def update_sprint(
     sprint_id: int,
     sprint: SprintUpdate,
@@ -608,6 +788,7 @@ def update_sprint(
         require_role(["ADMIN", "DEVELOPER"])
     )
 ):
+
     existing_sprint = (
         db.query(Sprint)
         .filter(Sprint.id == sprint_id)
@@ -620,18 +801,27 @@ def update_sprint(
             detail="Sprint not found"
         )
 
-    update_data = sprint.model_dump(exclude_unset=True)
+    update_data = sprint.model_dump(
+        exclude_unset=True
+    )
 
     for field, value in update_data.items():
-        setattr(existing_sprint, field, value)
+        setattr(
+            existing_sprint,
+            field,
+            value
+        )
 
     db.commit()
     db.refresh(existing_sprint)
 
     return existing_sprint
 
-# Assign Issue to Sprint
-@app.put("/issues/{issue_id}/sprint/{sprint_id}", response_model=IssueResponse)
+
+@app.put(
+    "/issues/{issue_id}/sprint/{sprint_id}",
+    response_model=IssueResponse
+)
 def assign_issue_to_sprint(
     issue_id: int,
     sprint_id: int,
@@ -640,6 +830,7 @@ def assign_issue_to_sprint(
         require_role(["ADMIN", "DEVELOPER"])
     )
 ):
+
     issue = (
         db.query(Issue)
         .filter(Issue.id == issue_id)
@@ -671,13 +862,17 @@ def assign_issue_to_sprint(
 
     return issue
 
-# Get Issues in Sprint
-@app.get("/sprints/{sprint_id}/issues", response_model=list[IssueResponse])
+
+@app.get(
+    "/sprints/{sprint_id}/issues",
+    response_model=list[IssueResponse]
+)
 def get_sprint_issues(
     sprint_id: int,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+
     sprint = (
         db.query(Sprint)
         .filter(Sprint.id == sprint_id)
@@ -699,8 +894,11 @@ def get_sprint_issues(
 
     return issues
 
-# Remove Issue from Sprint
-@app.delete("/issues/{issue_id}/sprint", response_model=IssueResponse)
+
+@app.delete(
+    "/issues/{issue_id}/sprint",
+    response_model=IssueResponse
+)
 def remove_issue_from_sprint(
     issue_id: int,
     db: Session = Depends(get_db),
@@ -708,6 +906,7 @@ def remove_issue_from_sprint(
         require_role(["ADMIN", "DEVELOPER"])
     )
 ):
+
     issue = (
         db.query(Issue)
         .filter(Issue.id == issue_id)
@@ -727,7 +926,7 @@ def remove_issue_from_sprint(
 
     return issue
 
-# Delete Sprint
+
 @app.delete("/sprints/{sprint_id}")
 def delete_sprint(
     sprint_id: int,
@@ -736,6 +935,7 @@ def delete_sprint(
         require_role(["ADMIN"])
     )
 ):
+
     sprint = (
         db.query(Sprint)
         .filter(Sprint.id == sprint_id)
@@ -750,7 +950,9 @@ def delete_sprint(
 
     assigned_issues = (
         db.query(Issue)
-        .filter(Issue.sprint_id == sprint_id)
+        .filter(
+            Issue.sprint_id == sprint_id
+        )
         .count()
     )
 
@@ -770,12 +972,17 @@ def delete_sprint(
         "message": "Sprint deleted successfully"
     }
 
-# Issue Analytics
+
+# ============================================================
+# ANALYTICS
+# ============================================================
+
 @app.get("/analytics/issues")
 def issue_analytics(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+
     total_issues = db.query(Issue).count()
 
     status_counts = {}
@@ -794,12 +1001,13 @@ def issue_analytics(
         "issues_by_status": status_counts
     }
 
-# Priority Analytics
+
 @app.get("/analytics/priority")
 def priority_analytics(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+
     total_issues = db.query(Issue).count()
 
     priority_counts = {}
@@ -818,68 +1026,13 @@ def priority_analytics(
         "issues_by_priority": priority_counts
     }
 
-# Admin Dashboard Analytics
-@app.get("/admin/dashboard")
-def admin_dashboard(
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(
-        require_role(["ADMIN"])
-    )
-):
-    total_issues = db.query(Issue).count()
-    total_users = db.query(User).count()
-    total_sprints = db.query(Sprint).count()
 
-    return {
-        "total_issues": total_issues,
-        "total_users": total_users,
-        "total_sprints": total_sprints
-    }
-
-# Issue Summary Report
-@app.get("/reports/summary")
-def issue_summary_report(
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
-):
-    total_issues = db.query(Issue).count()
-
-    open_issues = (
-        db.query(Issue)
-        .filter(
-            Issue.status.notin_([
-                IssueStatus.RESOLVED,
-                IssueStatus.CLOSED
-            ])
-        )
-        .count()
-    )
-
-    resolved_issues = (
-        db.query(Issue)
-        .filter(Issue.status == IssueStatus.RESOLVED)
-        .count()
-    )
-
-    closed_issues = (
-        db.query(Issue)
-        .filter(Issue.status == IssueStatus.CLOSED)
-        .count()
-    )
-
-    return {
-        "total_issues": total_issues,
-        "open_issues": open_issues,
-        "resolved_issues": resolved_issues,
-        "closed_issues": closed_issues
-    }
-
-# Severity Analytics
 @app.get("/analytics/severity")
 def severity_analytics(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+
     total_issues = db.query(Issue).count()
 
     severity_counts = {}
@@ -898,7 +1051,77 @@ def severity_analytics(
         "issues_by_severity": severity_counts
     }
 
-# Issue Filter Report
+
+# ============================================================
+# ADMIN DASHBOARD
+# ============================================================
+
+@app.get("/admin/dashboard")
+def admin_dashboard(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(
+        require_role(["ADMIN"])
+    )
+):
+
+    total_issues = db.query(Issue).count()
+    total_users = db.query(User).count()
+    total_sprints = db.query(Sprint).count()
+
+    return {
+        "total_issues": total_issues,
+        "total_users": total_users,
+        "total_sprints": total_sprints
+    }
+
+
+# ============================================================
+# REPORTS
+# ============================================================
+
+@app.get("/reports/summary")
+def issue_summary_report(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+
+    total_issues = db.query(Issue).count()
+
+    open_issues = (
+        db.query(Issue)
+        .filter(
+            Issue.status.notin_([
+                IssueStatus.RESOLVED,
+                IssueStatus.CLOSED
+            ])
+        )
+        .count()
+    )
+
+    resolved_issues = (
+        db.query(Issue)
+        .filter(
+            Issue.status == IssueStatus.RESOLVED
+        )
+        .count()
+    )
+
+    closed_issues = (
+        db.query(Issue)
+        .filter(
+            Issue.status == IssueStatus.CLOSED
+        )
+        .count()
+    )
+
+    return {
+        "total_issues": total_issues,
+        "open_issues": open_issues,
+        "resolved_issues": resolved_issues,
+        "closed_issues": closed_issues
+    }
+
+
 @app.get("/reports/issues")
 def issue_filter_report(
     status: IssueStatus | None = None,
@@ -907,26 +1130,47 @@ def issue_filter_report(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+
     query = db.query(Issue)
 
     if status is not None:
-        query = query.filter(Issue.status == status)
+        query = query.filter(
+            Issue.status == status
+        )
 
     if priority is not None:
-        query = query.filter(Issue.priority == priority)
+        query = query.filter(
+            Issue.priority == priority
+        )
 
     if severity is not None:
-        query = query.filter(Issue.severity == severity)
+        query = query.filter(
+            Issue.severity == severity
+        )
 
     issues = query.all()
 
     return {
         "total_results": len(issues),
+
         "filters": {
-            "status": status.value if status else None,
-            "priority": priority.value if priority else None,
-            "severity": severity.value if severity else None
+            "status": (
+                status.value
+                if status
+                else None
+            ),
+            "priority": (
+                priority.value
+                if priority
+                else None
+            ),
+            "severity": (
+                severity.value
+                if severity
+                else None
+            )
         },
+
         "issues": [
             {
                 "id": issue.id,
@@ -940,16 +1184,18 @@ def issue_filter_report(
         ]
     }
 
-# Sprint Report
+
 @app.get("/reports/sprints")
 def sprint_report(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+
     sprints = db.query(Sprint).all()
 
     return {
         "total_sprints": len(sprints),
+
         "sprints": [
             {
                 "id": sprint.id,
@@ -962,13 +1208,16 @@ def sprint_report(
         ]
     }
 
-# Sprint Issue Report
-@app.get("/reports/sprints/{sprint_id}/issues")
+
+@app.get(
+    "/reports/sprints/{sprint_id}/issues"
+)
 def sprint_issue_report(
     sprint_id: int,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+
     sprint = (
         db.query(Sprint)
         .filter(Sprint.id == sprint_id)
@@ -983,7 +1232,9 @@ def sprint_issue_report(
 
     issues = (
         db.query(Issue)
-        .filter(Issue.sprint_id == sprint_id)
+        .filter(
+            Issue.sprint_id == sprint_id
+        )
         .all()
     )
 
@@ -993,7 +1244,9 @@ def sprint_issue_report(
             "name": sprint.name,
             "status": sprint.status.value
         },
+
         "total_issues": len(issues),
+
         "issues": [
             {
                 "id": issue.id,
@@ -1007,13 +1260,16 @@ def sprint_issue_report(
         ]
     }
 
-# Sprint Status Summary Report
-@app.get("/reports/sprints/{sprint_id}/summary")
+
+@app.get(
+    "/reports/sprints/{sprint_id}/summary"
+)
 def sprint_status_summary(
     sprint_id: int,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+
     sprint = (
         db.query(Sprint)
         .filter(Sprint.id == sprint_id)
@@ -1029,6 +1285,7 @@ def sprint_status_summary(
     status_counts = {}
 
     for status in IssueStatus:
+
         count = (
             db.query(Issue)
             .filter(
@@ -1040,7 +1297,9 @@ def sprint_status_summary(
 
         status_counts[status.value] = count
 
-    total_issues = sum(status_counts.values())
+    total_issues = sum(
+        status_counts.values()
+    )
 
     return {
         "sprint": {
@@ -1048,21 +1307,246 @@ def sprint_status_summary(
             "name": sprint.name,
             "status": sprint.status.value
         },
+
         "total_issues": total_issues,
+
         "issues_by_status": status_counts
     }
 
-# Webhook Test
+
+# ============================================================
+# WEBHOOK
+# ============================================================
+
 @app.post("/webhooks/test")
 def webhook_test(
     current_user: dict = Depends(get_current_user)
 ):
+
     result = send_webhook(
         event="BUGFLOW_TEST",
         data={
-            "message": "BugFlow webhook integration is working",
+            "message": (
+                "BugFlow webhook integration "
+                "is working"
+            ),
             "project": "BugFlow"
         }
     )
 
     return result
+
+@app.post("/tags", response_model=TagResponse)
+def create_tag(
+    tag: TagCreate,
+    db: Session = Depends(get_db)
+):
+    existing_tag = db.query(Tag).filter(
+        Tag.name == tag.name
+    ).first()
+
+    if existing_tag:
+        raise HTTPException(
+            status_code=400,
+            detail="Tag already exists"
+        )
+
+    new_tag = Tag(name=tag.name)
+
+    db.add(new_tag)
+    db.commit()
+    db.refresh(new_tag)
+
+    return new_tag
+
+@app.get("/tags", response_model=list[TagResponse])
+def get_tags(
+    db: Session = Depends(get_db)
+):
+    tags = db.query(Tag).order_by(Tag.name.asc()).all()
+
+    return tags
+
+@app.post("/issues/{issue_id}/tags/{tag_id}")
+def assign_tag_to_issue(
+    issue_id: int,
+    tag_id: int,
+    db: Session = Depends(get_db)
+):
+    issue = db.query(Issue).filter(
+        Issue.id == issue_id
+    ).first()
+
+    if not issue:
+        raise HTTPException(
+            status_code=404,
+            detail="Issue not found"
+        )
+
+    tag = db.query(Tag).filter(
+        Tag.id == tag_id
+    ).first()
+
+    if not tag:
+        raise HTTPException(
+            status_code=404,
+            detail="Tag not found"
+        )
+
+    existing = db.query(IssueTag).filter(
+        IssueTag.issue_id == issue_id,
+        IssueTag.tag_id == tag_id
+    ).first()
+
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Tag is already assigned to this issue"
+        )
+
+    issue_tag = IssueTag(
+        issue_id=issue_id,
+        tag_id=tag_id
+    )
+
+    db.add(issue_tag)
+    db.commit()
+
+    return {
+        "message": "Tag assigned successfully",
+        "issue_id": issue_id,
+        "tag_id": tag_id,
+        "tag_name": tag.name
+    }
+
+@app.get("/issues/{issue_id}/tags", response_model=list[TagResponse])
+def get_issue_tags(
+    issue_id: int,
+    db: Session = Depends(get_db)
+):
+    issue = db.query(Issue).filter(
+        Issue.id == issue_id
+    ).first()
+
+    if not issue:
+        raise HTTPException(
+            status_code=404,
+            detail="Issue not found"
+        )
+
+    tags = (
+        db.query(Tag)
+        .join(
+            IssueTag,
+            Tag.id == IssueTag.tag_id
+        )
+        .filter(IssueTag.issue_id == issue_id)
+        .order_by(Tag.name.asc())
+        .all()
+    )
+
+    return tags
+
+@app.get("/issues/{issue_id}/duplicates")
+def detect_duplicate_issues(
+    issue_id: int,
+    db: Session = Depends(get_db)
+):
+    issue = db.query(Issue).filter(
+        Issue.id == issue_id
+    ).first()
+
+    if not issue:
+        raise HTTPException(
+            status_code=404,
+            detail="Issue not found"
+        )
+
+    all_issues = db.query(Issue).filter(
+        Issue.id != issue_id
+    ).all()
+
+    duplicates = []
+
+    for other_issue in all_issues:
+        title_similarity = SequenceMatcher(
+            None,
+            issue.title.lower(),
+            other_issue.title.lower()
+        ).ratio()
+
+        description_similarity = SequenceMatcher(
+            None,
+            issue.description.lower(),
+            other_issue.description.lower()
+        ).ratio()
+
+        similarity = (
+            title_similarity * 0.7
+            + description_similarity * 0.3
+        )
+
+        if similarity >= 0.70:
+            duplicates.append({
+                "issue_id": other_issue.id,
+                "issue_key": other_issue.issue_key,
+                "title": other_issue.title,
+                "similarity": round(similarity, 2)
+            })
+
+    duplicates.sort(
+        key=lambda item: item["similarity"],
+        reverse=True
+    )
+
+    return {
+        "issue_id": issue.id,
+        "issue_key": issue.issue_key,
+        "duplicates": duplicates
+    }
+    
+@app.post("/issues/{issue_id}/merge/{duplicate_issue_id}")
+def merge_duplicate_issue(
+    issue_id: int,
+    duplicate_issue_id: int,
+    db: Session = Depends(get_db)
+):
+    main_issue = db.query(Issue).filter(
+        Issue.id == issue_id
+    ).first()
+
+    if not main_issue:
+        raise HTTPException(
+            status_code=404,
+            detail="Main issue not found"
+        )
+
+    duplicate_issue = db.query(Issue).filter(
+        Issue.id == duplicate_issue_id
+    ).first()
+
+    if not duplicate_issue:
+        raise HTTPException(
+            status_code=404,
+            detail="Duplicate issue not found"
+        )
+
+    if issue_id == duplicate_issue_id:
+        raise HTTPException(
+            status_code=400,
+            detail="An issue cannot be merged with itself"
+        )
+
+    duplicate_issue.duplicate_of_id = main_issue.id
+
+    db.commit()
+    db.refresh(duplicate_issue)
+
+    return {
+        "message": "Issue merged as duplicate successfully",
+        "main_issue_id": main_issue.id,
+        "main_issue_key": main_issue.issue_key,
+        "duplicate_issue_id": duplicate_issue.id,
+        "duplicate_issue_key": duplicate_issue.issue_key,
+        "duplicate_of_id": duplicate_issue.duplicate_of_id
+    }

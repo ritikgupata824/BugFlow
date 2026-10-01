@@ -7,6 +7,10 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .database import Base
 
 
+# =========================
+# Issue Type
+# =========================
+
 class IssueType(str, Enum):
     BUG = "BUG"
     FEATURE_REQUEST = "FEATURE_REQUEST"
@@ -15,6 +19,10 @@ class IssueType(str, Enum):
     SUPPORT_TICKET = "SUPPORT_TICKET"
 
 
+# =========================
+# Severity
+# =========================
+
 class Severity(str, Enum):
     MINOR = "MINOR"
     MAJOR = "MAJOR"
@@ -22,12 +30,31 @@ class Severity(str, Enum):
     BLOCKER = "BLOCKER"
 
 
+# =========================
+# Business Impact
+# =========================
+
+class BusinessImpact(str, Enum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+
+
+# =========================
+# Priority
+# =========================
+
 class Priority(str, Enum):
     LOW = "LOW"
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
     URGENT = "URGENT"
 
+
+# =========================
+# Issue Status
+# =========================
 
 class IssueStatus(str, Enum):
     REPORTED = "REPORTED"
@@ -40,6 +67,10 @@ class IssueStatus(str, Enum):
     CLOSED = "CLOSED"
     REOPENED = "REOPENED"
 
+
+# =========================
+# Issue
+# =========================
 
 class Issue(Base):
     __tablename__ = "issues"
@@ -82,6 +113,12 @@ class Issue(Base):
         nullable=False
     )
 
+    business_impact: Mapped[BusinessImpact] = mapped_column(
+        SAEnum(BusinessImpact),
+        nullable=False,
+        default=BusinessImpact.MEDIUM
+    )
+
     priority: Mapped[Priority] = mapped_column(
         SAEnum(Priority),
         nullable=False
@@ -113,7 +150,17 @@ class Issue(Base):
         nullable=False,
         index=True
     )
-    sprint_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+    sprint_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        index=True
+    )
+
+    duplicate_of_id: Mapped[int | None] = mapped_column(
+    Integer,
+    nullable=True
+)
 
     reporter_id: Mapped[int] = mapped_column(
         Integer,
@@ -138,6 +185,10 @@ class Issue(Base):
         nullable=False
     )
 
+
+# =========================
+# Issue Comments
+# =========================
 
 class IssueComment(Base):
     __tablename__ = "issue_comments"
@@ -170,6 +221,10 @@ class IssueComment(Base):
         nullable=False
     )
 
+
+# =========================
+# Issue Activity / Audit
+# =========================
 
 class IssueActivity(Base):
     __tablename__ = "issue_activities"
@@ -208,14 +263,20 @@ class IssueActivity(Base):
     )
 
 
+# =========================
 # Sprint Status
+# =========================
+
 class SprintStatus(str, Enum):
     PLANNED = "PLANNED"
     ACTIVE = "ACTIVE"
     COMPLETED = "COMPLETED"
 
 
+# =========================
 # Sprint
+# =========================
+
 class Sprint(Base):
     __tablename__ = "sprints"
 
@@ -258,12 +319,20 @@ class Sprint(Base):
     )
 
 
+# =========================
+# User Role
+# =========================
+
 class UserRole(str, Enum):
     ADMIN = "ADMIN"
     DEVELOPER = "DEVELOPER"
     TESTER = "TESTER"
     REPORTER = "REPORTER"
 
+
+# =========================
+# User
+# =========================
 
 class User(Base):
     __tablename__ = "users"
@@ -308,4 +377,34 @@ class User(Base):
         DateTime,
         default=datetime.utcnow,
         nullable=False
+    )
+
+class Tag(Base):
+    __tablename__ = "tags"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        index=True
+    )
+
+    name: Mapped[str] = mapped_column(
+        String(50),
+        unique=True,
+        nullable=False,
+        index=True
+    )
+
+
+class IssueTag(Base):
+    __tablename__ = "issue_tags"
+
+    issue_id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True
+    )
+
+    tag_id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True
     )

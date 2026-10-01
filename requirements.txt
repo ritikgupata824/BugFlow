@@ -4,3 +4,5 @@ uvicorn
 python-jose
 passlib[bcrypt]
 python-multipart
+pytest==9.1.1
+httpx2==2.13.1

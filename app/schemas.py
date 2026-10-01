@@ -3,6 +3,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict
 
 from .models import (
+    BusinessImpact,
     IssueStatus,
     IssueType,
     Priority,
@@ -18,6 +19,7 @@ class IssueCreate(BaseModel):
     description: str
     reproduction_steps: str | None = None
     severity: Severity
+    business_impact: BusinessImpact = BusinessImpact.MEDIUM
     priority: Priority
     affected_module: str | None = None
     environment: str | None = None
@@ -39,6 +41,7 @@ class IssueResponse(BaseModel):
     description: str
     reproduction_steps: str | None
     severity: Severity
+    business_impact: BusinessImpact
     priority: Priority
     status: IssueStatus
     affected_module: str | None
@@ -58,6 +61,7 @@ class IssueUpdate(BaseModel):
     description: str | None = None
     reproduction_steps: str | None = None
     severity: Severity | None = None
+    business_impact: BusinessImpact | None = None
     priority: Priority | None = None
     affected_module: str | None = None
     environment: str | None = None
@@ -162,3 +166,13 @@ class SprintResponse(BaseModel):
     end_date: datetime
     status: SprintStatus
     project_key: str
+
+class TagCreate(BaseModel):
+    name: str
+
+
+class TagResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
