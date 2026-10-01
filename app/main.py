@@ -32,7 +32,7 @@ from .models import (
     Tag
 )
 
-from app.schemas import (
+from .schemas import (
     IssueCreate,
     IssueResponse,
     IssueUpdate,
@@ -48,7 +48,7 @@ from app.schemas import (
     SprintUpdate,
     SprintResponse,
     TagCreate,
-TagResponse,
+    TagResponse,
 )
 
 

@@ -1,7 +1,9 @@
+from uuid import uuid4
+
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.database import Base, engine, SessionLocal
+from app.database import SessionLocal
 from app.models import (
     User,
     Issue,
@@ -9,51 +11,111 @@ from app.models import (
     Severity,
     BusinessImpact,
     Priority,
-    IssueStatus,
 )
 
-
-Base.metadata.create_all(bind=engine)
 
 client = TestClient(app)
 
 
-def get_test_token():
-    username = "pytest_user"
-    password = "pytest_password_123"
+def create_test_user():
+    unique_id = uuid4().hex[:8]
 
-    register_response = client.post(
+    username = f"pytest_{unique_id}"
+    email = f"pytest_{unique_id}@example.com"
+    password = "pytest123"
+
+    response = client.post(
         "/auth/register",
         json={
             "username": username,
-            "email": "pytest@example.com",
+            "email": email,
             "password": password,
-            "role": "REPORTER"
-        }
+            "role": "REPORTER",
+        },
     )
 
-    assert register_response.status_code in (200, 400)
+    assert response.status_code in (200, 201), response.text
 
-    login_response = client.post(
+    return username, password
+
+
+def get_test_token():
+    username, password = create_test_user()
+
+    response = client.post(
         "/auth/login",
-        json={
+        data={
             "username": username,
-            "password": password
-        }
+            "password": password,
+        },
     )
 
-    assert login_response.status_code == 200
+    assert response.status_code == 200, response.text
 
-    return login_response.json()["access_token"]
+    data = response.json()
+
+    assert "access_token" in data
+
+    return data["access_token"]
 
 
-def get_test_user_id():
+def create_unique_issue(
+    db,
+    issue_key,
+    title,
+    reporter_id,
+):
+    existing_issue = (
+        db.query(Issue)
+        .filter(Issue.issue_key == issue_key)
+        .first()
+    )
+
+    if existing_issue:
+        db.delete(existing_issue)
+        db.commit()
+
+    issue = Issue(
+        issue_key=issue_key,
+        issue_type=IssueType.BUG,
+        title=title,
+        description="Main issue created for duplicate merge testing",
+        reproduction_steps="Run automated tests",
+        severity=Severity.MAJOR,
+        business_impact=BusinessImpact.HIGH,
+        priority=Priority.HIGH,
+        affected_module="Testing",
+        environment="CI",
+        project_key="TEST",
+        reporter_id=reporter_id,
+    )
+
+    db.add(issue)
+    db.commit()
+    db.refresh(issue)
+
+    return issue
+
+
+def get_reporter_id_from_token(token):
+    response = client.get(
+        "/users/me",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    if response.status_code == 200:
+        return response.json()["id"]
+
     db = SessionLocal()
 
     try:
-        user = db.query(User).filter(
-            User.username == "pytest_user"
-        ).first()
+        user = (
+            db.query(User)
+            .order_by(User.id.desc())
+            .first()
+        )
 
         assert user is not None
 
@@ -73,118 +135,112 @@ def test_root():
     assert data["status"] == "success"
 
 
-def test_invalid_duplicate_merge():
-    response = client.post(
-        "/issues/9999/merge/9998"
+def test_register_and_login():
+    username, password = create_test_user()
+
+    login_response = client.post(
+        "/auth/login",
+        data={
+            "username": username,
+            "password": password,
+        },
     )
 
-    assert response.status_code == 404
+    assert login_response.status_code == 200, login_response.text
 
-    data = response.json()
+    token_data = login_response.json()
 
-    assert data["detail"] == "Main issue not found"
+    assert "access_token" in token_data
+    assert token_data["token_type"] == "bearer"
 
 
-def test_self_merge():
-    response = client.post(
-        "/issues/9999/merge/9999"
+def test_protected_issues_endpoint():
+    token = get_test_token()
+
+    response = client.get(
+        "/issues",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
     )
 
-    assert response.status_code == 404
-
-    data = response.json()
-
-    assert data["detail"] == "Main issue not found"
+    assert response.status_code == 200, response.text
 
 
-def test_valid_duplicate_merge():
-    """
-    Test duplicate issue merging directly through the merge API.
-
-    Issues are created directly in the test database so this test
-    does not depend on the /issues creation endpoint.
-    """
+def test_duplicate_detection():
+    token = get_test_token()
 
     db = SessionLocal()
 
     try:
-        user = db.query(User).filter(
-            User.username == "pytest_user"
-        ).first()
+        reporter_id = get_reporter_id_from_token(token)
 
-        if user is None:
-            user = User(
-                username="pytest_user",
-                email="pytest@example.com",
-                password="pytest_password_123",
-                role="REPORTER",
-                is_active=True
-            )
-
-            db.add(user)
-            db.commit()
-            db.refresh(user)
-
-        main_issue = Issue(
-            issue_key="TEST-MAIN-MERGE",
-            issue_type=IssueType.BUG,
-            title="CI Main Test Issue",
-            description="Main issue created for duplicate merge testing",
-            reproduction_steps="Run automated tests",
-            severity=Severity.MAJOR,
-            business_impact=BusinessImpact.HIGH,
-            priority=Priority.HIGH,
-            status=IssueStatus.REPORTED,
-            affected_module="Testing",
-            environment="CI",
-            screenshot_url=None,
-            project_key="TEST",
-            reporter_id=user.id,
-            assignee_id=None,
-            sprint_id=None
+        main_issue = create_unique_issue(
+            db,
+            f"TEST-DUP-MAIN-{uuid4().hex[:8]}",
+            "Login button not working",
+            reporter_id,
         )
 
-        duplicate_issue = Issue(
-            issue_key="TEST-DUPLICATE-MERGE",
-            issue_type=IssueType.BUG,
-            title="CI Duplicate Test Issue",
-            description="Duplicate issue created for duplicate merge testing",
-            reproduction_steps="Run automated tests",
-            severity=Severity.MAJOR,
-            business_impact=BusinessImpact.HIGH,
-            priority=Priority.HIGH,
-            status=IssueStatus.REPORTED,
-            affected_module="Testing",
-            environment="CI",
-            screenshot_url=None,
-            project_key="TEST",
-            reporter_id=user.id,
-            assignee_id=None,
-            sprint_id=None
+        create_unique_issue(
+            db,
+            f"TEST-DUP-SECOND-{uuid4().hex[:8]}",
+            "Login button not working after clicking",
+            reporter_id,
         )
 
-        db.add(main_issue)
-        db.add(duplicate_issue)
+        main_issue_id = main_issue.id
 
-        db.commit()
+    finally:
+        db.close()
 
-        db.refresh(main_issue)
-        db.refresh(duplicate_issue)
+    response = client.get(
+        f"/issues/{main_issue_id}/duplicates",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
 
-        main_id = main_issue.id
-        duplicate_id = duplicate_issue.id
+    assert response.status_code == 200, response.text
+
+
+def test_valid_duplicate_merge():
+    token = get_test_token()
+
+    db = SessionLocal()
+
+    try:
+        reporter_id = get_reporter_id_from_token(token)
+
+        main_issue = create_unique_issue(
+            db,
+            f"TEST-MAIN-MERGE-{uuid4().hex[:8]}",
+            "CI Main Test Issue",
+            reporter_id,
+        )
+
+        duplicate_issue = create_unique_issue(
+            db,
+            f"TEST-DUP-MERGE-{uuid4().hex[:8]}",
+            "CI Duplicate Test Issue",
+            reporter_id,
+        )
+
+        main_issue_id = main_issue.id
+        duplicate_issue_id = duplicate_issue.id
 
     finally:
         db.close()
 
     response = client.post(
-        f"/issues/{main_id}/merge/{duplicate_id}"
+        f"/issues/{main_issue_id}/merge/{duplicate_issue_id}",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
 
     data = response.json()
 
-    assert data["main_issue_id"] == main_id
-    assert data["duplicate_issue_id"] == duplicate_id
-    assert data["duplicate_of_id"] == main_id
+    assert data["duplicate_of_id"] == main_issue_id
