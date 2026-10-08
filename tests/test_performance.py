@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 
+
 client = TestClient(app)
 
 
@@ -51,31 +52,48 @@ def get_test_token():
     return data["access_token"]
 
 
-def test_reports_summary_response_time():
+def calculate_p95(values):
+    sorted_values = sorted(values)
+
+    index = int(0.95 * len(sorted_values)) - 1
+
+    index = max(0, min(index, len(sorted_values) - 1))
+
+    return sorted_values[index]
+
+
+def test_reports_summary_response_time_p95():
     token = get_test_token()
 
-    start_time = perf_counter()
+    response_times = []
 
-    response = client.get(
-        "/reports/summary",
-        headers={
-            "Authorization": f"Bearer {token}"
-        },
-    )
+    for _ in range(20):
+        start_time = perf_counter()
 
-    elapsed_ms = (
-        perf_counter() - start_time
-    ) * 1000
+        response = client.get(
+            "/reports/summary",
+            headers={
+                "Authorization": f"Bearer {token}"
+            },
+        )
 
-    assert response.status_code == 200, response.text
+        elapsed_ms = (
+            perf_counter() - start_time
+        ) * 1000
 
-    data = response.json()
+        assert response.status_code == 200, response.text
 
-    assert "total_issues" in data
-    assert "open_issues" in data
-    assert "resolved_issues" in data
-    assert "closed_issues" in data
+        data = response.json()
 
-    assert elapsed_ms < 300, (
-        f"API response took {elapsed_ms:.2f} ms"
+        assert "total_issues" in data
+        assert "open_issues" in data
+        assert "resolved_issues" in data
+        assert "closed_issues" in data
+
+        response_times.append(elapsed_ms)
+
+    p95_ms = calculate_p95(response_times)
+
+    assert p95_ms < 300, (
+        f"API p95 response time was {p95_ms:.2f} ms"
     )
