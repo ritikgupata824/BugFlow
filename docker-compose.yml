@@ -1,0 +1,7 @@
+services:
+  bugflow:
+    build: .
+    container_name: bugflow-container
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
