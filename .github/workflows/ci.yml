@@ -1,3 +1,4 @@
+
 name: BugFlow CI
 
 on:
@@ -30,9 +31,12 @@ jobs:
           python create_database.py
 
       - name: Run tests
+        env:
+          BUGFLOW_SECRET_KEY: "ci-test-secret-key-only-for-github-actions-123456789"
         run: |
           python -m pytest
 
       - name: Check Python files
         run: |
           python -m compileall app
+
