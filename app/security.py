@@ -1,12 +1,17 @@
+
+import os
 from datetime import datetime, timedelta, timezone
 
+from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
+# Load environment variables from the project .env file
+load_dotenv()
 
-# Password Hashing
+# Password hashing
 pwd_context = CryptContext(
     schemes=["bcrypt"],
     deprecated="auto"
@@ -27,19 +32,24 @@ def verify_password(
     )
 
 
-# JWT Configuration
-SECRET_KEY = "bugflow-secret-key-change-this-later"
+# JWT configuration
+SECRET_KEY = os.getenv("BUGFLOW_SECRET_KEY")
+
+if not SECRET_KEY:
+    raise RuntimeError(
+        "BUGFLOW_SECRET_KEY is missing. "
+        "Please configure it in your .env file."
+    )
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-
-# OAuth2 Bearer Token
+# OAuth2 bearer token
 oauth2_scheme = OAuth2PasswordBearer(
     tokenUrl="/auth/login"
 )
 
 
-# Create JWT Token
 def create_access_token(data: dict) -> str:
     to_encode = data.copy()
 
@@ -47,9 +57,7 @@ def create_access_token(data: dict) -> str:
         minutes=ACCESS_TOKEN_EXPIRE_MINUTES
     )
 
-    to_encode.update({
-        "exp": expire
-    })
+    to_encode.update({"exp": expire})
 
     return jwt.encode(
         to_encode,
@@ -58,7 +66,6 @@ def create_access_token(data: dict) -> str:
     )
 
 
-# Verify JWT Token
 def verify_access_token(token: str):
     try:
         payload = jwt.decode(
@@ -66,14 +73,12 @@ def verify_access_token(token: str):
             SECRET_KEY,
             algorithms=[ALGORITHM]
         )
-
         return payload
 
     except JWTError:
         return None
 
 
-# Get Current User from JWT
 def get_current_user(
     token: str = Depends(oauth2_scheme)
 ):
@@ -88,7 +93,6 @@ def get_current_user(
     return payload
 
 
-# Role Based Access Control
 def require_role(allowed_roles: list[str]):
     def role_checker(
         current_user: dict = Depends(get_current_user)
